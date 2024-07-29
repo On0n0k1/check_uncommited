@@ -13,6 +13,7 @@ use cli::Cli;
 
 #[derive(Debug)]
 pub enum Status {
+    NoRemote { path: PathBuf },
     UptoDate { path: PathBuf },
     BranchAhead { path: PathBuf, buffer: String },
     ChangesNotStaged { path: PathBuf, buffer: String },
@@ -23,6 +24,7 @@ pub enum Status {
 
 #[derive(Debug, Default)]
 pub struct StatusSummary {
+    no_remote: Vec<PathBuf>,
     up_to_date: Vec<PathBuf>,
     branch_ahead: Vec<PathBuf>,
     changes_not_staged: Vec<PathBuf>,
@@ -33,6 +35,7 @@ pub struct StatusSummary {
 impl StatusSummary {
     fn increment(&mut self, status: &Status) {
         match status {
+            Status::NoRemote { path } => self.no_remote.push(path.clone()),
             Status::UptoDate { path } => self.up_to_date.push(path.clone()),
             Status::BranchAhead { path, buffer: _ } => self.branch_ahead.push(path.clone()),
             Status::UntrackedFiles { path, buffer: _ } => self.untracked_files.push(path.clone()),
@@ -45,6 +48,7 @@ impl StatusSummary {
     }
 
     pub fn short(&self) {
+        println!("NoRemote: {}", self.no_remote.len());
         println!("UptoDate: {}", self.up_to_date.len());
         println!("BranchAhead: {}", self.branch_ahead.len());
         println!("UntrackedFiles: {}", self.untracked_files.len());
@@ -53,6 +57,11 @@ impl StatusSummary {
     }
 
     pub fn long(&self) {
+        println!("--- NoRemote ---\n\n");
+        for entry in &self.no_remote {
+            println!("{entry:?}");
+        }
+
         println!("--- UptoDate ---\n\n");
         for entry in &self.up_to_date {
             println!("{entry:?}");
@@ -77,24 +86,27 @@ impl StatusSummary {
 }
 
 impl Status {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Result<Self, String> {
+        if check_remote(&path)? {
+            return Ok(Self::NoRemote { path });
+        }
         let buffer: String = get_status(&path);
         if buffer.contains("Your branch is ahead of") {
-            return Self::BranchAhead { path, buffer };
+            return Ok(Self::BranchAhead { path, buffer });
         }
         if buffer.contains("Changes not staged for commit:") {
-            return Self::ChangesNotStaged { path, buffer };
+            return Ok(Self::ChangesNotStaged { path, buffer });
         }
         if buffer.contains("Untracked files:") {
-            return Self::UntrackedFiles { path, buffer };
+            return Ok(Self::UntrackedFiles { path, buffer });
         }
         if buffer.contains("Your branch is up to date with") {
-            return Self::UptoDate { path };
+            return Ok(Self::UptoDate { path });
         }
         if buffer.contains("fatal: not a git repository ") {
-            return Self::NotAGitRepository { path, buffer };
+            return Ok(Self::NotAGitRepository { path, buffer });
         }
-        Self::Other { path, buffer }
+        Ok(Self::Other { path, buffer })
     }
 
     pub(crate) fn search(
@@ -115,7 +127,8 @@ impl Status {
             if path.is_file() {
                 if let Some(file_name) = path.file_name() {
                     if file_name == "Cargo.toml" {
-                        let status: Self = Self::new(parent_path.clone());
+                        let status: Self = Self::new(parent_path.clone())
+                            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
                         if cli.debug {
                             println!("{status:?}");
                         }
@@ -141,24 +154,58 @@ fn get_status(path: &PathBuf) -> String {
         .spawn()
         .expect("Failed to execute command");
 
-    let mut stdout = output.stdout.expect("Failed to capture stdout");
-    let mut stderr = output.stderr.expect("Failed to capture stderr");
+    let mut stdout = output.stdout.expect("Failed to capture stdout status");
+    let mut stderr = output.stderr.expect("Failed to capture stderr status");
 
     let mut buffer: String = String::new();
     stdout
         .read_to_string(&mut buffer)
-        .expect("Failed to capture stdout");
+        .expect("Failed to capture stdout status 2");
 
     let mut error_buffer: String = String::new();
     stderr
         .read_to_string(&mut error_buffer)
-        .expect("failed to read stderr");
+        .expect("failed to read stderr status 2");
 
     if !error_buffer.is_empty() {
         return error_buffer;
     }
 
     buffer
+}
+
+/// Check if there is a remote to push to
+///
+/// When we run cargo new, there will be git files in the directory. Meaning we may not have created an origin, but it still treated as one.
+fn check_remote(path: &PathBuf) -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["remote", "-v"])
+        .current_dir(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to execute command");
+
+    let mut stdout = output.stdout.expect("Failed to capture stdout remote");
+    let mut stderr = output.stderr.expect("Failed to capture stderr remote");
+
+    let mut buffer: String = String::new();
+    stdout
+        .read_to_string(&mut buffer)
+        .expect("Failed to capture stdout remote 2");
+
+    let mut error_buffer: String = String::new();
+    stderr
+        .read_to_string(&mut error_buffer)
+        .expect("failed to read stderr remote 2");
+
+    if !error_buffer.is_empty() {
+        if error_buffer.contains("not a git repository") {
+            return Ok(false);
+        }
+        return Err(error_buffer);
+    }
+    Ok(buffer.is_empty())
 }
 
 fn main() {
